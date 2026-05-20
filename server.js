@@ -5,8 +5,30 @@ const { URL } = require('url');
 
 const ROOT_DIR = __dirname;
 const PORT = Number(process.env.PORT || 4173);
+const DEFAULT_OLLAMA_MODELS = [
+  'fitted-golf',
+  'qwen2.5:3b-instruct',
+  'qwen2.5:3b',
+  'qwen2.5:1.5b-instruct',
+  'qwen2.5:1.5b',
+];
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://127.0.0.1:11434/api/chat';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'fitted-golf';
+const PRIMARY_OLLAMA_MODEL =
+  typeof process.env.OLLAMA_MODEL === 'string' && process.env.OLLAMA_MODEL.trim()
+    ? process.env.OLLAMA_MODEL.trim()
+    : DEFAULT_OLLAMA_MODELS[0];
+const OLLAMA_MODEL_CANDIDATES = [
+  ...new Set(
+    [
+      PRIMARY_OLLAMA_MODEL,
+      ...(process.env.OLLAMA_MODEL_CANDIDATES || '')
+        .split(',')
+        .map(item => item.trim())
+        .filter(Boolean),
+      ...DEFAULT_OLLAMA_MODELS,
+    ].filter(Boolean),
+  ),
+];
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -309,19 +331,19 @@ function maybeParseJson(text) {
   }
 }
 
-async function callOllama(messages, { jsonMode = false, temperature = 0.4 } = {}) {
+async function callOllama(messages, { jsonMode = false, temperature = 0.4, model = PRIMARY_OLLAMA_MODEL } = {}) {
   const openAiCompat = OLLAMA_URL.includes('/v1/');
 
   const body = openAiCompat
     ? {
-        model: OLLAMA_MODEL,
+        model,
         messages,
         stream: false,
         temperature,
         ...(jsonMode ? { response_format: { type: 'json_object' } } : {}),
       }
     : {
-        model: OLLAMA_MODEL,
+        model,
         messages,
         stream: false,
         options: { temperature },
@@ -343,15 +365,47 @@ async function callOllama(messages, { jsonMode = false, temperature = 0.4 } = {}
   return extractResponseText(data, openAiCompat);
 }
 
+function shouldTryNextOllamaModel(error) {
+  const message = String(error?.message || '').toLowerCase();
+  return (
+    message.includes('404') ||
+    message.includes('not found') ||
+    message.includes('model') ||
+    message.includes('pull')
+  );
+}
+
+async function callOllamaWithFallbackModels(messages, options = {}) {
+  let lastError = null;
+
+  for (const model of OLLAMA_MODEL_CANDIDATES) {
+    try {
+      const text = await callOllama(messages, {
+        ...options,
+        model,
+      });
+      return { text, model };
+    } catch (error) {
+      lastError = error;
+      if (!shouldTryNextOllamaModel(error)) break;
+    }
+  }
+
+  throw lastError || new Error('No Ollama model available.');
+}
+
 async function generateExplanation(payload) {
   try {
-    const raw = await callOllama(buildExplainMessages(payload), {
+    const { text: raw, model } = await callOllamaWithFallbackModels(buildExplainMessages(payload), {
       jsonMode: true,
       temperature: 0.25,
     });
     const parsed = maybeParseJson(raw);
     if (!parsed) throw new Error('Model did not return valid JSON.');
-    return normalizeExplainOutput(payload, parsed, 'ollama');
+    return {
+      ...normalizeExplainOutput(payload, parsed, 'ollama'),
+      model,
+    };
   } catch (error) {
     return {
       ...buildExplainFallback(payload),
@@ -364,7 +418,7 @@ async function generateChatAnswer(payload, messages) {
   const question = extractLastUserMessage(messages);
 
   try {
-    const answer = await callOllama(buildChatMessages(payload, messages), {
+    const { text: answer, model } = await callOllamaWithFallbackModels(buildChatMessages(payload, messages), {
       jsonMode: false,
       temperature: 0.5,
     });
@@ -375,6 +429,7 @@ async function generateChatAnswer(payload, messages) {
     return {
       mode: 'ollama',
       answer: trimmed,
+      model,
     };
   } catch (error) {
     return {
@@ -434,7 +489,8 @@ function createServer() {
       sendJson(res, 200, {
         ok: true,
         ollamaUrl: OLLAMA_URL,
-        ollamaModel: OLLAMA_MODEL,
+        ollamaModel: PRIMARY_OLLAMA_MODEL,
+        ollamaModelCandidates: OLLAMA_MODEL_CANDIDATES,
       });
       return;
     }
@@ -475,7 +531,8 @@ if (require.main === module) {
   server.listen(PORT, () => {
     console.log(`FITTED local server listening on http://127.0.0.1:${PORT}`);
     console.log(`Ollama endpoint: ${OLLAMA_URL}`);
-    console.log(`Ollama model: ${OLLAMA_MODEL}`);
+    console.log(`Primary Ollama model: ${PRIMARY_OLLAMA_MODEL}`);
+    console.log(`Ollama model candidates: ${OLLAMA_MODEL_CANDIDATES.join(', ')}`);
   });
 }
 
